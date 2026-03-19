@@ -8,18 +8,21 @@ cli({
   domain: 'x.com',
   strategy: Strategy.UI,
   browser: true,
+  timeoutSeconds: 600, // 10 min — batch operation iterating many conversations
   args: [
-    { name: 'keyword', type: 'string', required: true, help: 'Keyword to match in message content (e.g. "微信")' },
+    { name: 'keyword', type: 'string', required: true, help: 'Keywords to match (comma-separated for OR, e.g. "群,微信")' },
     { name: 'max', type: 'int', required: false, default: 20, help: 'Maximum number of requests to accept (default: 20)' },
   ],
   columns: ['index', 'status', 'user', 'message'],
   func: async (page: IPage | null, kwargs: any) => {
     if (!page) throw new Error('Requires browser');
 
-    const keyword: string = kwargs.keyword;
+    const keywords: string[] = kwargs.keyword.split(',').map((k: string) => k.trim()).filter(Boolean);
     const maxAccepts: number = kwargs.max ?? 20;
     const results: Array<{ index: number; status: string; user: string; message: string }> = [];
     let acceptCount = 0;
+    // Track already-visited conversations to avoid infinite loops
+    const visited = new Set<string>();
 
     for (let round = 0; round < maxAccepts + 50; round++) {
       if (acceptCount >= maxAccepts) break;
@@ -28,62 +31,98 @@ cli({
       await page.goto('https://x.com/messages/requests');
       await page.wait(4);
 
-      // Step 2: Extract conversation URLs from the request list
-      const urlsResult = await page.evaluate(`(async () => {
+      // Step 2: Get conversation count and preview text to find keyword matches
+      const convInfo = await page.evaluate(`(async () => {
         try {
           let attempts = 0;
-          let urls = [];
+          let convs = [];
           while (attempts < 10) {
-            const anchors = Array.from(document.querySelectorAll('a[href]'));
-            urls = anchors
-              .map(a => a.href)
-              .filter(href => /\\/messages\\/\\d+-\\d+/.test(href));
-            urls = [...new Set(urls)];
-            if (urls.length > 0) break;
+            convs = Array.from(document.querySelectorAll('[data-testid="conversation"]'));
+            if (convs.length > 0) break;
             await new Promise(r => setTimeout(r, 1000));
             attempts++;
           }
-          return { ok: true, urls };
+          if (convs.length === 0) return { ok: false, count: 0, items: [] };
+
+          // Extract preview info from each conversation
+          const items = convs.map((conv, idx) => {
+            const text = conv.innerText || '';
+            const link = conv.querySelector('a[href]');
+            const href = link ? link.href : '';
+            // Extract username from the conversation preview
+            const lines = text.split('\\n').filter(l => l.trim());
+            const user = lines[0] || 'Unknown';
+            return { idx, text, href, user };
+          });
+          return { ok: true, count: convs.length, items };
         } catch(e) {
-          return { ok: false, error: String(e), urls: [] };
+          return { ok: false, error: String(e), count: 0, items: [] };
         }
       })()`);
 
-      if (!urlsResult?.ok || !urlsResult.urls?.length) {
+      if (!convInfo?.ok || convInfo.count === 0) {
         if (results.length === 0) {
           results.push({ index: 1, status: 'info', user: 'System', message: 'No message requests found' });
         }
         break;
       }
 
-      const urls: string[] = urlsResult.urls;
       let foundInThisRound = false;
 
-      // Step 3: Try each conversation in this round
-      for (const url of urls) {
+      // Step 3: Find first unvisited conversation with keyword match in preview
+      for (const item of convInfo.items) {
         if (acceptCount >= maxAccepts) break;
+        const convKey = item.href || `conv-${item.idx}`;
+        if (visited.has(convKey)) continue;
+        visited.add(convKey);
 
-        await page.goto(url);
-        await page.wait(3);
+        // Check if preview text contains any keyword
+        const previewMatch = keywords.some((k: string) => item.text.includes(k));
+        if (!previewMatch) continue;
 
-        // Read chat content, check keyword, and accept if matched
+        // Step 4: Click this conversation to open it
+        const clickResult = await page.evaluate(`(async () => {
+          try {
+            const convs = Array.from(document.querySelectorAll('[data-testid="conversation"]'));
+            const conv = convs[${item.idx}];
+            if (!conv) return { ok: false, error: 'Conversation element not found' };
+            conv.click();
+            await new Promise(r => setTimeout(r, 2000));
+            return { ok: true };
+          } catch(e) {
+            return { ok: false, error: String(e) };
+          }
+        })()`);
+
+        if (!clickResult?.ok) continue;
+
+        // Wait for conversation to load
+        await page.wait(2);
+
+        // Step 5: Read full chat content and find Accept button
         const res = await page.evaluate(`(async () => {
           try {
-            const keyword = ${JSON.stringify(keyword)};
+            const keywords = ${JSON.stringify(keywords)};
 
             // Get username from conversation header
             const heading = document.querySelector('[data-testid="conversation-header"]') ||
-                            document.querySelector('h2');
-            const username = heading ? heading.innerText.trim().split('\\n')[0] : 'Unknown';
+                            document.querySelector('[data-testid="DM-conversation-header"]');
+            let username = 'Unknown';
+            if (heading) {
+              username = heading.innerText.trim().split('\\n')[0];
+            }
 
             // Read full chat area text
             const chatArea = document.querySelector('[data-testid="DmScrollerContainer"]') ||
+                             document.querySelector('[data-testid="DMConversationBody"]') ||
+                             document.querySelector('main [data-testid="cellInnerDiv"]')?.closest('section') ||
                              document.querySelector('main');
             const text = chatArea ? chatArea.innerText : '';
 
-            // Check if keyword is present
-            if (!text.includes(keyword)) {
-              return { status: 'skipped', user: username, message: 'No keyword match' };
+            // Verify keyword match in full chat content
+            const matchedKw = keywords.filter(k => text.includes(k));
+            if (matchedKw.length === 0) {
+              return { status: 'skipped', user: username, message: 'No keyword match in full content' };
             }
 
             // Find the Accept button
@@ -99,9 +138,9 @@ cli({
 
             // Click Accept
             acceptBtn.click();
-            await new Promise(r => setTimeout(r, 1500));
+            await new Promise(r => setTimeout(r, 2000));
 
-            // Check if there's a confirmation dialog
+            // Check for confirmation dialog
             const btnsAfter = Array.from(document.querySelectorAll('[role="button"]'));
             const confirmBtn = btnsAfter.find(btn => {
               const t = btn.innerText.trim().toLowerCase();
@@ -109,41 +148,41 @@ cli({
             });
             if (confirmBtn) {
               confirmBtn.click();
-              await new Promise(r => setTimeout(r, 800));
+              await new Promise(r => setTimeout(r, 1000));
             }
 
-            return { status: 'accepted', user: username, message: 'Accepted! Keyword: ' + keyword };
+            return { status: 'accepted', user: username, message: 'Accepted! Matched: ' + matchedKw.join(', ') };
           } catch(e) {
             return { status: 'error', user: 'system', message: String(e) };
           }
         })()`);
 
-        if (res) {
-          if (res.status === 'accepted') {
-            acceptCount++;
-            foundInThisRound = true;
-            results.push({
-              index: acceptCount,
-              status: res.status,
-              user: res.user || 'Unknown',
-              message: res.message || 'Accepted',
-            });
-            // After accept, Twitter redirects to /messages — break out to re-navigate to /messages/requests
-            await page.wait(2);
-            break;
-          }
-          // Don't add skipped items to output to keep it clean
+        if (res?.status === 'accepted') {
+          acceptCount++;
+          foundInThisRound = true;
+          results.push({
+            index: acceptCount,
+            status: 'accepted',
+            user: res.user || 'Unknown',
+            message: res.message || 'Accepted',
+          });
+          // After accept, Twitter redirects to /messages — loop back to /messages/requests
+          await page.wait(2);
+          break; // break inner loop, outer loop will re-navigate to requests
+        } else if (res?.status === 'no_button') {
+          // Already accepted, skip
+          continue;
         }
       }
 
-      // If no match found in this round, we've exhausted all requests
+      // If no match found in this round, we've exhausted all visible requests
       if (!foundInThisRound) {
         break;
       }
     }
 
     if (results.length === 0) {
-      results.push({ index: 0, status: 'info', user: 'System', message: `No requests matched keyword "${keyword}"` });
+      results.push({ index: 0, status: 'info', user: 'System', message: `No requests matched keywords "${keywords.join(', ')}"` });
     }
 
     return results;
